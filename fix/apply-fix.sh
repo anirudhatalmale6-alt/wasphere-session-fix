@@ -99,6 +99,16 @@ echo "    Only the dashboard-ui image is rebuilt. Postgres, the WhatsApp"
 echo "    gateway and their volumes are not touched."
 
 if [ "$ASSUME_YES" != "1" ]; then
+  # No terminal (piped through ssh, run from a script): do NOT rebuild on a
+  # guess. Stop with the files patched and say what is left to do.
+  if [ ! -r /dev/tty ]; then
+    echo ""
+    echo "    No terminal available to ask, so nothing has been rebuilt."
+    echo "    The source and .env are patched. Finish with either:"
+    echo "        bash $0 $WASPHERE_DIR -y"
+    echo "        or:  cd $WASPHERE_DIR && $DC build dashboard-ui && $DC up -d"
+    exit 0
+  fi
   printf '\n    Continue? [y/N] '
   read -r reply < /dev/tty
   case "$reply" in
