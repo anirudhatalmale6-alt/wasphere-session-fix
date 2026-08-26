@@ -1,0 +1,157 @@
+diff --git a/.env.example b/.env.example
+index c72ccc9..c461255 100644
+--- a/.env.example
++++ b/.env.example
+@@ -36,6 +36,29 @@ INTERNAL_WEBHOOK_SECRET=change_me_openssl_rand_hex_32
+ # Change to https://app.your-domain.com when behind a reverse proxy.
+ DASHBOARD_UI_URL=http://localhost:3004
+ 
++# ── Login cookies ─────────────────────────────────────────────────────────────
++# The dashboard stores its session in the cookies wa_access / wa_refresh. They
++# are sent with the `Secure` attribute, and a browser only STORES a Secure
++# cookie on a secure origin: https://…, or localhost (which is why the default
++# setup above works).
++#
++# Serve the dashboard over plain http on anything else — http://<your-ip>:3004,
++# or a domain with no certificate — and the browser throws both cookies away
++# without a word. Nothing appears in the browser console or the container logs.
++# The login call itself returns 200, the redirect to /dashboard runs, the
++# server-side guard finds no cookie, and you land back on the login page with
++# "Your session has expired. Please log in again." Recreating the user or
++# changing the password makes no difference — the credentials were never the
++# problem.
++#
++#   COOKIE_SECURE=true    behind HTTPS — correct for production, and the default
++#   COOKIE_SECURE=false   plain http on an IP / a host with no TLS
++#
++# false is a real trade-off: the session cookie then travels in clear text and
++# anyone on the network path can read it and impersonate the user. Treat it as a
++# temporary state and put TLS in front as soon as you can, then set it back.
++# COOKIE_SECURE=true
++
+ # Host ports (override only if 3000/3001/3004 clash with something else)
+ # DASHBOARD_UI_PORT=3004
+ # DASHBOARD_API_PORT=3000
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 1eb9a07..426bd15 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -115,6 +115,13 @@ services:
+       # Public URL of the WA Server (only for the Meta webhook callback shown in
+       # the New-Session dialog). Leave empty unless you expose the Meta webhook.
+       WA_SERVER_PUBLIC_URL: ${WA_SERVER_PUBLIC_URL:-}
++      # `Secure` attribute on the wa_access / wa_refresh cookies. A browser
++      # refuses to store a Secure cookie on a plain-http origin (an IP:port with
++      # no TLS), so login succeeds and the very next page still looks logged
++      # out — "Your session has expired. Please log in again."
++      #   true   behind HTTPS  (keep this — it is the correct production setting)
++      #   false  plain http on an IP or a host with no certificate
++      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+       NODE_ENV: production
+     ports:
+       - "${DASHBOARD_UI_PORT:-3004}:3004"
+diff --git a/packages/dashboard-ui/app/api/auth/accept-invite/route.ts b/packages/dashboard-ui/app/api/auth/accept-invite/route.ts
+index 8aefeee..928bb06 100644
+--- a/packages/dashboard-ui/app/api/auth/accept-invite/route.ts
++++ b/packages/dashboard-ui/app/api/auth/accept-invite/route.ts
+@@ -1,10 +1,10 @@
+ import { cookies } from "next/headers"
+ import { serverPost } from "@/lib/server-fetch"
+-
+-const SECURE = process.env.NODE_ENV === "production"
++import { cookieSecure } from "@/lib/cookie-security"
+ 
+ // POST /api/auth/accept-invite { token, email, password } — join via invite link
+ export async function POST(request: Request) {
++  const SECURE = cookieSecure()
+   let body: { token: string; email: string; password: string }
+   try {
+     body = await request.json()
+diff --git a/packages/dashboard-ui/app/api/auth/login/route.ts b/packages/dashboard-ui/app/api/auth/login/route.ts
+index de01242..4390f9a 100644
+--- a/packages/dashboard-ui/app/api/auth/login/route.ts
++++ b/packages/dashboard-ui/app/api/auth/login/route.ts
+@@ -1,9 +1,10 @@
+ import { cookies } from "next/headers";
+ import { serverPost } from "@/lib/server-fetch";
+-
+-const SECURE = process.env.NODE_ENV === "production";
++import { cookieSecure } from "@/lib/cookie-security";
+ 
+ export async function POST(request: Request) {
++  const SECURE = cookieSecure();
++
+   let body: { email: string; password: string };
+   try {
+     body = await request.json();
+diff --git a/packages/dashboard-ui/app/api/auth/refresh/route.ts b/packages/dashboard-ui/app/api/auth/refresh/route.ts
+index 1b2254c..bb4f3de 100644
+--- a/packages/dashboard-ui/app/api/auth/refresh/route.ts
++++ b/packages/dashboard-ui/app/api/auth/refresh/route.ts
+@@ -1,9 +1,9 @@
+ import { cookies } from "next/headers";
+ import { serverPost } from "@/lib/server-fetch";
+-
+-const SECURE = process.env.NODE_ENV === "production";
++import { cookieSecure } from "@/lib/cookie-security";
+ 
+ export async function POST() {
++  const SECURE = cookieSecure();
+   const cookieStore = await cookies();
+   const refreshToken = cookieStore.get("wa_refresh")?.value;
+ 
+diff --git a/packages/dashboard-ui/app/api/auth/register/route.ts b/packages/dashboard-ui/app/api/auth/register/route.ts
+index 4e9a5d1..7011df9 100644
+--- a/packages/dashboard-ui/app/api/auth/register/route.ts
++++ b/packages/dashboard-ui/app/api/auth/register/route.ts
+@@ -1,9 +1,11 @@
+ import { cookies } from "next/headers"
+ 
++import { cookieSecure } from "@/lib/cookie-security"
++
+ const API_BASE = process.env.DASHBOARD_API_URL ?? "http://localhost:3000"
+-const SECURE = process.env.NODE_ENV === "production"
+ 
+ export async function POST(request: Request) {
++  const SECURE = cookieSecure()
+   let body: { email: string; password: string }
+   try {
+     body = await request.json()
+diff --git a/packages/dashboard-ui/lib/cookie-security.ts b/packages/dashboard-ui/lib/cookie-security.ts
+new file mode 100644
+index 0000000..968abf0
+--- /dev/null
++++ b/packages/dashboard-ui/lib/cookie-security.ts
+@@ -0,0 +1,32 @@
++/**
++ * Should the auth cookies (wa_access / wa_refresh) carry the `Secure` attribute?
++ *
++ * A browser only stores a `Secure` cookie when the page origin is a secure
++ * context. `https://…` qualifies, and so does `localhost` — which is why the
++ * stock instructions ("open http://localhost:3004") work. A public origin
++ * served over plain http, e.g. http://203.0.113.10:3004, does NOT: the cookie
++ * is discarded silently, with no error in the browser and nothing in the server
++ * logs. Login then succeeds, the redirect to /dashboard runs, the server-side
++ * guard finds no wa_access cookie and bounces to /login?reason=expired —
++ * "Your session has expired. Please log in again."
++ *
++ * COOKIE_SECURE makes that an explicit deployment choice instead of a side
++ * effect of NODE_ENV:
++ *
++ *   COOKIE_SECURE=true    behind HTTPS (the right answer for production)
++ *   COOKIE_SECURE=false   plain http on an IP or a TLS-less host
++ *   unset                 previous behaviour: secure when NODE_ENV=production
++ *
++ * Read at call time, never at module load: a build-time read would bake the
++ * value into the image and ignore whatever the container is actually given.
++ */
++export function cookieSecure(): boolean {
++  const explicit = process.env.COOKIE_SECURE;
++
++  if (explicit !== undefined && explicit.trim() !== "") {
++    const v = explicit.trim().toLowerCase();
++    return v === "true" || v === "1" || v === "yes";
++  }
++
++  return process.env.NODE_ENV === "production";
++}
